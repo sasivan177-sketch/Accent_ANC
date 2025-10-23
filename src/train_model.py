@@ -1,254 +1,247 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import librosa
 import torch.nn.functional as F
-import torchcrepe
-import os
-import sys
+from pathlib import Path
+from tqdm import tqdm
+import warnings
+from typing import List, Tuple, Dict, Any
 
-# --- CONFIGURATION ---
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-SAMPLE_RATE = 16000
-EPOCHS = 100
-LEARNING_RATE = 1e-4
-BATCH_SIZE = 4
-LOG_INTERVAL = 100
+# --- 1. Import Project Modules ---
+from .encoder import Encoder
+from .rvq_quantizer import RVQQuantizer
+from .accent_encoder import AccentEncoder
+from .pitch_residual_coding import PitchResidualCoder 
+from .decoder_vocoder import DecoderVocoder
+from .loss_functions import CompositeLoss
 
-# --- 1. LOSS FUNCTIONS (Copied and fixed from previous step) ---
-
-# The PitchLoss class contains the fix for the TypeError: predict()
-class PitchLoss(nn.Module):
-    def __init__(self, sample_rate=SAMPLE_RATE, device=DEVICE):
-        super().__init__()
-        self.sample_rate = sample_rate
-        self.device = device
-        # FIX: Load the CREPE model ONCE
-        self.pitch_model = torchcrepe.get_pretrained_model(model_capacity='full').to(self.device)
-        self.pitch_model.eval() 
-
-    def forward(self, y_hat: torch.Tensor, f0_target: torch.Tensor):
-        y_hat_flat = y_hat.squeeze(1) if y_hat.dim() == 3 else y_hat
-
-        with torch.no_grad():
-            # CORRECTED CALL: Pass the loaded model object
-            f0_hat_salience = torchcrepe.predict(
-                y_hat_flat, 
-                self.sample_rate, 
-                model=self.pitch_model, 
-                device=self.device,
-                batch_size=512, 
-                viterbi=True
-            )
-        
-        f0_hat = f0_hat_salience[0]
-        salience = f0_hat_salience[1]
-        
-        # Resize f0_target to match f0_hat's time dimension
-        f0_target_resized = F.interpolate(
-            f0_target.unsqueeze(1), size=f0_hat.size(-1), mode='linear', align_corners=False
-        ).squeeze(1)
-
-        return f0_hat, salience, f0_target_resized
-
-class GeneratorLossFn(nn.Module):
-    def __init__(self, device=DEVICE):
-        super().__init__()
-        self.pitch_loss_fn = PitchLoss(device=device) 
-        self.l1_loss = nn.L1Loss()
-        
-    def generator_loss(self, y_hat, f0_original, y, d_outputs_g, d_outputs_r):
-        """Calculates total Generator loss (Adversarial, Reconstruction, Pitch)."""
-        
-        # --- Pitch Loss ---
-        f0_hat, salience, f0_target_resized = self.pitch_loss_fn(y_hat, f0_original.detach())
-        loss_pitch = torch.sum(salience * (f0_hat - f0_target_resized)**2) / (torch.sum(salience) + 1e-6)
-        
-        # --- Reconstruction Loss (L1) ---
-        loss_recon = self.l1_loss(y_hat, y) 
-
-        # --- Adversarial Loss (Non-saturating GAN loss) ---
-        # d_outputs_g is typically a list of lists: [[score_1, fm_1], [score_2, fm_2], ...]
-        adv_scores_g = [d_output[0] for d_output in d_outputs_g]
-        loss_adv = sum([-torch.mean(score) for score in adv_scores_g])
-
-        # --- Feature Matching Loss (L1 on intermediate features) ---
-        fm_losses = []
-        for d_output_g, d_output_r in zip(d_outputs_g, d_outputs_r):
-             for fm_g, fm_r in zip(d_output_g[1], d_output_r[1]):
-                 # Detach real features to use them as fixed targets
-                 fm_losses.append(self.l1_loss(fm_g, fm_r.detach()))
-        loss_fm = sum(fm_losses) / len(fm_losses) if fm_losses else torch.tensor(0.0).to(DEVICE)
-
-
-        # --- Total Generator Loss ---
-        # Weights are crucial hyperparameters here
-        loss_g = 1.0 * loss_recon + 1.0 * loss_pitch + 1.0 * loss_adv + 2.0 * loss_fm
-        
-        loss_dict = {
-            "G/total": loss_g.item(),
-            "G/recon": loss_recon.item(),
-            "G/pitch": loss_pitch.item(),
-            "G/adv": loss_adv.item(),
-            "G/fm": loss_fm.item()
-        }
-        
-        return loss_g, loss_dict
-
-# --- 2. MODEL PLACEHOLDERS ---
-# Note: In a real project, these would be imported from src/discriminator.py
-class DiscriminatorLossFn(nn.Module):
+# --- 2. Placeholder Discriminators (FIXED: Registering parameters) ---
+class MultiPeriodDiscriminator(nn.Module):
     def __init__(self):
         super().__init__()
-        self.mse_loss = nn.MSELoss()
+        print("Note: Using placeholder MultiPeriodDiscriminator.")
+        # FIX: Explicitly define a layer that has trainable parameters
+        self.conv = nn.Conv1d(1, 1, 1) 
+    def forward(self, x):
+        # FIX: Output feature list directly (not wrapped in another list)
+        score = torch.randn(x.size(0), 1, requires_grad=True).to(x.device)
+        features = [torch.randn(x.size(0), 1, requires_grad=True).to(x.device)]
+        return [score], features
 
-    def discriminator_loss(self, d_outputs_r, d_outputs_g):
-        """Calculates total Discriminator loss."""
-        
-        loss_r = 0.0
-        loss_g = 0.0
-        
-        # Real scores should be close to 1
-        for d_output in d_outputs_r:
-            score_r = d_output[0]
-            loss_r += self.mse_loss(score_r, torch.ones_like(score_r))
-        
-        # Generated scores should be close to 0
-        for d_output in d_outputs_g:
-            score_g = d_output[0]
-            loss_g += self.mse_loss(score_g, torch.zeros_like(score_g))
-            
-        loss_d = loss_r + loss_g
-        
-        loss_dict = {
-            "D/total": loss_d.item(),
-            "D/real": loss_r.item(),
-            "D/gen": loss_g.item()
-        }
-        return loss_d, loss_dict
-
-class Generator(nn.Module):
-    # The model that takes features (x) and outputs audio (y_hat)
-    def forward(self, x): return torch.randn(x.size(0), 1, 16000 * 4).to(x.device) # Mock: (B, 1, AudioLen)
-class MultiPeriodDiscriminator(nn.Module):
-    # The discriminator that judges generated audio (y_hat)
-    def forward(self, y): 
-        # Mock: return a list of (score, features) tuples for each sub-discriminator
-        return [(torch.randn(y.size(0), 1).to(y.device), [torch.randn(1), torch.randn(1)])]
 class MultiScaleDiscriminator(nn.Module):
-    # Another discriminator
-    def forward(self, y): 
-        return [(torch.randn(y.size(0), 1).to(y.device), [torch.randn(1), torch.randn(1)])]
+    def __init__(self):
+        super().__init__()
+        print("Note: Using placeholder MultiScaleDiscriminator.")
+        # FIX: Explicitly define a layer that has trainable parameters
+        self.conv = nn.Conv1d(1, 1, 1)
+    def forward(self, x):
+        # FIX: Output feature list directly (not wrapped in another list)
+        score = torch.randn(x.size(0), 1, requires_grad=True).to(x.device)
+        features = [torch.randn(x.size(0), 1, requires_grad=True).to(x.device)]
+        return [score], features
+
+# --- 3. Custom Dataset Loader (FIXED TENSOR DIMS) ---
+class FeatureDataset(Dataset):
+    def __init__(self, features_dir: Path, processed_dir: Path, segment_len: int = 16000):
+        self.features_dir = Path(features_dir)
+        self.processed_dir = Path(processed_dir)
+        self.segment_len = segment_len
+        self.data_list = self._create_data_list()
+        if not self.data_list:
+             warnings.warn(f"Dataset is empty! Checked {self.features_dir} for .npy files.", UserWarning)
+
+    def _create_data_list(self):
+        data = []
+        for feature_path in self.features_dir.rglob("*.npy"):
+            relative_path = feature_path.relative_to(self.features_dir)
+            wav_path = (self.processed_dir / relative_path).with_suffix(".wav")
+            if wav_path.exists():
+                data.append((feature_path, wav_path))
+        return data
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        feature_path, wav_path = self.data_list[idx]
+        features = np.load(feature_path, allow_pickle=True).item()
+        f0_original = torch.from_numpy(features['f0']).float()
+        mel_spectrogram = torch.from_numpy(features['mel_spectrogram']).float()
+        
+        y_np, sr = librosa.load(wav_path, sr=None, mono=True)
+        wav = torch.from_numpy(y_np).float().unsqueeze(0)
+        
+        T_wav = wav.shape[-1]
+        
+        if T_wav < self.segment_len:
+            padding_needed = self.segment_len - T_wav
+            wav = F.pad(wav, (0, padding_needed))
+            T_wav = self.segment_len
+        
+        start_wav = np.random.randint(0, T_wav - self.segment_len + 1)
+        wav_segment = wav[:, start_wav : start_wav + self.segment_len]
+
+        hop_length = 256 
+        segment_mel_len = self.segment_len // hop_length
+        start_mel = start_wav // hop_length
+        T_mel = mel_spectrogram.shape[-1]
+        end_mel = min(start_mel + segment_mel_len, T_mel)
+        mel_segment = mel_spectrogram[:, start_mel:end_mel]
+        f0_segment = f0_original[start_mel:end_mel]
+
+        if mel_segment.shape[-1] < segment_mel_len:
+            padding_needed = segment_mel_len - mel_segment.shape[-1]
+            mel_segment = F.pad(mel_segment, (0, padding_needed))
+            f0_segment = F.pad(f0_segment, (0, padding_needed))
+
+        # FIX: return the 2D segment (1, T_wav_seg). 
+        return mel_segment, f0_segment, wav_segment 
 
 
-# --- 3. MOCK DATA LOADER ---
-# Replaces actual data loading (Dataloader, Dataset)
-def get_data_loader(batch_size, num_iterations):
-    # Simulates a dataloader yielding (input_features, target_audio, target_f0)
-    class MockDataLoader:
-        def __iter__(self):
-            for _ in range(num_iterations):
-                # x: Input features (e.g., mel, accent embedding) - [B, Features, TimeSteps]
-                x = torch.randn(batch_size, 80, 100).to(DEVICE)
-                # y: Target audio - [B, 1, AudioSamples] (e.g., 4s @ 16kHz = 64000)
-                y = torch.randn(batch_size, 1, SAMPLE_RATE * 4).to(DEVICE)
-                # f0_original: Target F0 - [B, F0_TimeSteps]
-                f0_original = torch.randn(batch_size, 100).to(DEVICE) 
-                yield x, y, f0_original
-    return MockDataLoader()
+# --- 4. Training Configuration (Targeting 30 Minutes) ---
+BATCH_SIZE = 32 
+LEARNING_RATE = 2e-4
+EPOCHS = 1
+SAVE_INTERVAL = 1 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- 4. MAIN TRAINING FUNCTION ---
+Z_DIM = 128
+E_A_DIM = 128
+N_MELS = 80
+SEGMENT_LEN_WAV = 16000
 
-def train():
-    # --- Initialization ---
+
+def train(features_dir: Path, processed_dir: Path, models_dir: Path):
+    print(f"Starting training on device: {DEVICE} with BATCH_SIZE={BATCH_SIZE} and EPOCHS={EPOCHS}")
+
+    # --- Data Setup ---
+    train_dataset = FeatureDataset(features_dir, processed_dir, segment_len=SEGMENT_LEN_WAV)
+    if len(train_dataset) == 0:
+        print("Error: Dataset is empty. Check paths and feature files.")
+        return
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4)
+
+    # --- Model Initialization ---
+    encoder = Encoder(in_channels=N_MELS, latent_dim=Z_DIM).to(DEVICE)
+    rvq = RVQQuantizer(in_channels=Z_DIM).to(DEVICE)
+    accent_encoder = AccentEncoder(in_channels=N_MELS).to(DEVICE)
+    pitch_coder = PitchResidualCoder().to(DEVICE) 
+    generator = DecoderVocoder(z_dim=Z_DIM, e_a_dim=E_A_DIM).to(DEVICE)
     
-    # Models
-    generator = Generator().to(DEVICE)
-    mpd = MultiPeriodDiscriminator().to(DEVICE) # MPD
-    msd = MultiScaleDiscriminator().to(DEVICE) # MSD
-    discriminators = [mpd, msd]
-    
-    # Optimizers
-    optimizer_g = torch.optim.Adam(generator.parameters(), lr=LEARNING_RATE)
-    # Discriminator optimizer for all discriminators combined
-    optimizer_d = torch.optim.Adam([*mpd.parameters(), *msd.parameters()], lr=LEARNING_RATE) 
-    
-    # Loss Functions
-    loss_fn_g = GeneratorLossFn(device=DEVICE)
-    loss_fn_d = DiscriminatorLossFn()
-    
-    # Data Loader
-    num_iterations = 973 # Based on your log
-    data_loader = get_data_loader(BATCH_SIZE, num_iterations)
+    mpd = MultiPeriodDiscriminator().to(DEVICE)
+    msd = MultiScaleDiscriminator().to(DEVICE)
+    # The optimizers are happy now because mpd/msd have registered parameters
+    discriminator = nn.ModuleList([mpd, msd]).to(DEVICE) 
 
-    print(f"Starting Training on {DEVICE} for {EPOCHS} epochs...")
+    loss_fn = CompositeLoss(accent_encoder=accent_encoder, device=DEVICE)
+    
+    optim_G = optim.AdamW(
+        list(encoder.parameters()) + list(rvq.parameters()) + 
+        list(accent_encoder.parameters()) + list(pitch_coder.parameters()) + 
+        list(generator.parameters()),
+        lr=LEARNING_RATE, betas=(0.8, 0.99)
+    )
+    optim_D = optim.AdamW(
+        discriminator.parameters(),
+        lr=LEARNING_RATE, betas=(0.8, 0.99)
+    )
 
     # --- Training Loop ---
     for epoch in range(1, EPOCHS + 1):
+        G_loss_total = 0
+        D_loss_total = 0
         
-        generator.train()
-        for d in discriminators: d.train()
-
-        for i, (x, y, f0_original) in enumerate(data_loader, 1):
+        tqdm_loop = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
+        
+        for mel, f0_orig, y in tqdm_loop:
+            mel, f0_orig, y = mel.to(DEVICE), f0_orig.to(DEVICE), y.to(DEVICE)
             
-            # --- GENERATOR STEP ---
-            optimizer_g.zero_grad()
+            # --- A. Generator Step ---
+            optim_G.zero_grad()
             
-            # 1. Forward Pass
-            y_hat = generator(x)
+            z = encoder(mel)                      
+            z_q, _ = rvq(z)                       
+            e_a, _ = accent_encoder(mel)          
+            f0_recon = pitch_coder(f0_orig)       
             
-            # 2. Discriminator outputs for generated (g) and real (r) audio
-            d_outputs_g = [d(y_hat) for d in discriminators]
-            # Need to detach y to prevent gradient flow during D loss calculation
-            d_outputs_r = [d(y.detach()) for d in discriminators] 
+            y_hat = generator(z_q, e_a, f0_recon.unsqueeze(1).squeeze(1))
             
-            # 3. Calculate Generator Loss (uses corrected PitchLoss internally)
-            loss_g, loss_dict_g = loss_fn_g.generator_loss(
-                y_hat, f0_original.detach(), y, d_outputs_g, d_outputs_r
+            disc_real_outputs = [d(y) for d in discriminator]
+            disc_fake_outputs = [d(y_hat) for d in discriminator]
+            
+            disc_real_scores = [out[0] for out in disc_real_outputs]
+            disc_real_feats = [out[1] for out in disc_real_outputs]
+            disc_fake_scores = [out[0] for out in disc_fake_outputs] 
+            disc_fake_feats = [out[1] for out in disc_fake_outputs] 
+            
+            loss_g, loss_dict = loss_fn.generator_loss(
+                y=y, y_hat=y_hat, 
+                f0_original=f0_orig, f0_recon=f0_recon, 
+                disc_real_outputs=disc_real_scores, disc_fake_outputs=disc_fake_scores,
+                disc_real_feats=disc_real_feats, disc_fake_feats=disc_fake_feats
             )
             
-            # 4. Backward Pass and Update
             loss_g.backward()
-            optimizer_g.step()
+            optim_G.step()
+            G_loss_total += loss_g.item()
 
-            # --- DISCRIMINATOR STEP ---
-            optimizer_d.zero_grad()
+            # --- B. Discriminator Step ---
+            optim_D.zero_grad()
             
-            # Re-run D on generated audio (must be done after G's update)
-            # Use y_hat.detach() to prevent gradient flow to G
-            d_outputs_g_detached = [d(y_hat.detach()) for d in discriminators]
-            d_outputs_r_original = [d(y) for d in discriminators] # Re-run D on real audio
-
-            # 1. Calculate Discriminator Loss
-            loss_d, loss_dict_d = loss_fn_d.discriminator_loss(
-                d_outputs_r_original, d_outputs_g_detached
+            disc_fake_outputs_d = [d(y_hat.detach()) for d in discriminator]
+            disc_real_outputs_d = [d(y.detach()) for d in discriminator]
+            
+            disc_real_scores_d = [out[0] for out in disc_real_outputs_d]
+            disc_fake_scores_d = [out[0] for out in disc_fake_outputs_d]
+            
+            loss_d = loss_fn.discriminator_loss(
+                disc_real_scores_d, 
+                disc_fake_scores_d
             )
             
-            # 2. Backward Pass and Update
             loss_d.backward()
-            optimizer_d.step()
+            optim_D.step()
+            D_loss_total += loss_d.item()
             
-            # --- LOGGING ---
-            if i % LOG_INTERVAL == 0 or i == num_iterations:
-                print(
-                    f"Epoch {epoch}/{EPOCHS} | Iter {i}/{num_iterations} | "
-                    f"G Loss: {loss_dict_g['G/total']:.3f} (P: {loss_dict_g['G/pitch']:.3f}, R: {loss_dict_g['G/recon']:.3f}) | "
-                    f"D Loss: {loss_dict_d['D/total']:.3f}"
-                )
+            tqdm_loop.set_postfix(
+                G=f"{loss_g.item():.4f}", 
+                D=f"{loss_d.item():.4f}",
+                Mel=f"{loss_dict.get('L_Mel', 0):.4f}",
+                Pitch=f"{loss_dict.get('L_Pitch', 0):.4f}",
+                Spk=f"{loss_dict.get('L_Speaker', 0):.4f}"
+            )
 
-        # --- END OF EPOCH ---
-        print(f"\n--- Epoch {epoch} Finished ---\n")
-        # Save checkpoints here
-        # torch.save(generator.state_dict(), f"generator_{epoch}.pt")
+        # --- Logging and Checkpoint ---
+        avg_g_loss = G_loss_total / len(train_loader)
+        avg_d_loss = D_loss_total / len(train_loader)
+        
+        print(f"\nEpoch {epoch} Summary:")
+        print(f"  Avg G Loss: {avg_g_loss:.4f} | Avg D Loss: {avg_d_loss:.4f}")
+        
+        if epoch % SAVE_INTERVAL == 0:
+            checkpoint_path = models_dir / f"joint_model_ep{epoch}.pth"
+            print(f"Saving checkpoint to {checkpoint_path}")
+            torch.save({
+                'epoch': epoch,
+                'encoder_state_dict': encoder.state_dict(),
+                'rvq_state_dict': rvq.state_dict(),
+                'accent_encoder_state_dict': accent_encoder.state_dict(),
+                'pitch_coder_state_dict': pitch_coder.state_dict(), 
+                'generator_state_dict': generator.state_dict(),
+                'discriminator_state_dict': discriminator.state_dict(),
+                'optim_G_state_dict': optim_G.state_dict(),
+                'optim_D_state_dict': optim_D.state_dict(),
+                'avg_g_loss': avg_g_loss,
+            }, checkpoint_path)
 
 
 if __name__ == "__main__":
-    # Ensure torchcrepe is downloaded
-    # Note: Sometimes torchcrepe requires a pre-download step
-    try:
-        if not os.path.exists(os.path.expanduser('~/.cache/torch/crepe/full.pth')):
-             print("Downloading torchcrepe model weights...")
-             torchcrepe.get_pretrained_model(model_capacity='full')
-    except Exception as e:
-         print(f"Warning: Could not pre-download CREPE weights. It may download on first use. Error: {e}")
-         
-    # Call the main training function
-    train()
+    FEATURES_DIR = Path("data/features")
+    PROCESSED_DIR = Path("data/processed")
+    MODELS_DIR = Path("models")
+    MODELS_DIR.mkdir(exist_ok=True, parents=True)
+    
+    train(FEATURES_DIR, PROCESSED_DIR, MODELS_DIR)

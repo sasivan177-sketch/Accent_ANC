@@ -1,0 +1,18 @@
+# --- Deep Learning Libraries ---
+torch
+torchaudio
+torchvision
+
+# --- Scientific Computing & Data Handling ---
+numpy
+pandas
+scipy
+
+# --- Audio Processing & Feature Extraction ---
+librosa
+pyworld
+soundfile
+
+# --- Utility & Command Line ---
+tqdm
+torchcrepe
